@@ -153,11 +153,7 @@ def process_directory(directory_path, remote_directory, remote_host, username):
     for process in file_processes:
         process.join()
 
-    # Validate file size
-    if validate_file_size(remote_host, remote_file_path, file_path):
-        print(f"File {file_name} successfully transferred and size matches.")
-    else:
-        print(f"File {file_name} transfer validation failed.")
+    print("Completed transferring all files in directory.")
 
 
 def validate_file_size(remote_host, remote_path, local_path):
