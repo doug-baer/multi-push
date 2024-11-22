@@ -8,7 +8,7 @@ from multiprocessing import Process, Semaphore, Manager, current_process
 
 # Configuration
 SSH_PORT = 22
-PARTS_PER_FILE = 3 # Number of processes to handle file parts
+PARTS_PER_FILE = 4 # Number of processes to handle file parts
 MAX_RETRIES = 5 # Maximum number of retries for failed SSH/SFTP connections
 RETRY_DELAY = 60 # Delay in seconds between retries
 MAX_PROCESSES = 2 # Limit on concurrent file-processing processes
@@ -125,7 +125,7 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
   print(f"Process {num} failed after {MAX_RETRIES} attempts.")
 
 
-def process_file(file_path, remote_directory, remote_host, username, progress_queue):
+def process_file(file_path, remote_directory, remote_host, username, progress_queue, position):
   """
   Processes a single file by dividing it into parts, transferring each part concurrently,
   and validating the file size after transfer.
@@ -134,8 +134,15 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
   remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
   total_size = os.path.getsize(file_path)
 
-  # Initialize progress bar
-  with tqdm(total=total_size, desc=f"Transferring {file_name}", unit="B", unit_scale=True) as progress_bar:
+  # Initialize a progress bar: each file gets a new bar
+  with tqdm(
+    total=total_size,
+    desc=f"Pushing {file_name}",
+    unit="B",
+    unit_scale=True,
+    position=position,
+    leave=True,
+  ) as progress_bar:
     processes = []
 
     # Create processes for each part of the file
@@ -163,10 +170,11 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
       progress_bar.update(total_size - transferred_bytes)
 
   # Validate file size
-  if validate_file_size(remote_host, username, remote_file_path, file_path):
-    print(f"File {file_name} successfully transferred and validated.")
-  else:
+  if not validate_file_size(remote_host, username, remote_file_path, file_path):
     print(f"File {file_name} transfer validation failed.")
+  #else:
+  #  TODO: update the "files_transerred" table with the result (also, create the files_transferred table based on directory contents)
+  #  print(f"File {file_name} successfully transferred and validated.")
 
 
 def process_directory(directory_path, remote_directory, remote_host, username):
@@ -174,12 +182,13 @@ def process_directory(directory_path, remote_directory, remote_host, username):
   manager = Manager()
   progress_queue = manager.Queue()
 
-  def process_file_wrapper(file_path, remote_directory, remote_host, username, progress_queue):
+  def process_file_wrapper(file_path, remote_directory, remote_host, username, progress_queue, position):
     """Wrapper to acquire and release semaphore for file processing."""
     with process_semaphore: # Limit the number of concurrent files being processed
-      process_file(file_path, remote_directory, remote_host, username, progress_queue)
+      process_file(file_path, remote_directory, remote_host, username, progress_queue, position)
 
   file_processes = []
+  position = 0 # Initialize position for progress bars
 
   for root, _, files in os.walk(directory_path):
     # Compute the remote directory path based on the current directory structure
@@ -192,9 +201,13 @@ def process_directory(directory_path, remote_directory, remote_host, username):
       file_path = os.path.join(root, file_name)
       if os.path.isfile(file_path):
         # Start a process with a semaphore-wrapped function
-        process = Process(target=process_file_wrapper, args=(file_path, current_remote_dir, remote_host, username, progress_queue))
+        process = Process(
+          target=process_file_wrapper,
+          args=(file_path, current_remote_dir, remote_host, username, progress_queue, position),
+        )
         file_processes.append(process)
         process.start()
+        position += 1 # Increment position for the next file's progress bar
 
   # Wait for all file processes to finish
   for process in file_processes:
@@ -202,7 +215,7 @@ def process_directory(directory_path, remote_directory, remote_host, username):
 
   #TODO: report success / fail for entire process -- list failed files?  retry them? 
 
-  print("Completed transferring all files in directory.")
+  print("\nCompleted transferring all files in directory.")
 
 
 def main():
