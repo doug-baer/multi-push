@@ -2,7 +2,7 @@
 import os
 import argparse
 import time
-from paramiko import SSHClient, AutoAddPolicy, ssh_exception
+from paramiko import SSHClient, AutoAddPolicy, ssh_exception, SFTPError
 from tqdm import tqdm
 from multiprocessing import Process, Semaphore, Manager, current_process
 
@@ -61,6 +61,50 @@ def validate_file_size(remote_host, username, remote_path, local_path):
   finally:
    sftp.close()
    ssh.close()
+
+
+def remote_file_exists_and_matches_size(remote_host, username, remote_path, local_path):
+  """
+  Checks if a file exists on the remote server and matches the size of the local file.
+  (duplicates function of validate_file_size ... can we collapse them into one function?)
+
+  Args:
+    remote_host (str): The hostname or IP address of the remote server.
+    username (str): The username for the remote server.
+    remote_path (str): The full path of the file on the remote server.
+    local_path (str): The full path of the local file.
+
+  Returns:
+    bool: True if the file exists and matches the size, False otherwise.
+  """
+  local_size = os.path.getsize(local_path)
+  try:
+    ssh = SSHClient()
+    ssh.set_missing_host_key_policy(AutoAddPolicy())
+    ssh.connect(remote_host, port=22, username=username)
+
+    # Open SFTP session
+    sftp = ssh.open_sftp()
+
+    # Check remote file size
+    remote_size = sftp.stat(remote_path).st_size
+
+    if remote_size == local_size:
+      print(f"Remote file matches size: {remote_path} ({remote_size} bytes). Skipping transfer.")
+      return True
+    else:
+      print(f"Remote file exists but size differs: {remote_path} ({remote_size} bytes vs {local_size} bytes).")
+      return False
+
+  except SFTPError:
+    print(f"Remote file does not exist: {remote_path}")
+    return False
+  except Exception as e:
+    print(f"Error while checking remote file: {e}")
+    return False
+  finally:
+    sftp.close()
+    ssh.close()
 
 
 def upload_part(remote_host, username, remote_path, local_path, num, offset, part_size, progress_queue):
@@ -133,6 +177,11 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
   file_name = os.path.basename(file_path)
   remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
   total_size = os.path.getsize(file_path)
+
+  # Check if the file exists and matches size on the remote server
+  if remote_file_exists_and_matches_size(remote_host, username, remote_file_path, file_path):
+    print(f"{file_name} already exists at remote path and size matches. Skipping.")
+    return  # Skip transfer if the file already exists and matches size
 
   # Initialize a progress bar: each file gets a new bar
   with tqdm(
