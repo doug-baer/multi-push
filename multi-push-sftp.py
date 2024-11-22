@@ -48,7 +48,7 @@ def validate_file_size(remote_host, username, remote_path, local_path):
     remote_size = sftp.stat(remote_path).st_size
 
     if local_size == remote_size:
-      print(f"Validation successful: {local_path} ({local_size} bytes) matches {remote_path} ({remote_size} bytes).")
+      #print(f"Validation successful: {local_path} ({local_size} bytes) matches {remote_path} ({remote_size} bytes).")
       return True
     else:
       print(f"Validation failed: {local_path} ({local_size} bytes) does not match {remote_path} ({remote_size} bytes).")
@@ -74,7 +74,7 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
 
   while attempt < MAX_RETRIES:
     try:
-      print(f"Process {num} attempting SSH connection (Attempt {attempt + 1})")
+      # print(f"Process {num} attempting SSH connection (Attempt {attempt + 1})")
       ssh = SSHClient()
       ssh.set_missing_host_key_policy(AutoAddPolicy())
       ssh.connect(remote_host, port=SSH_PORT, username=username)
@@ -115,7 +115,7 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
       time.sleep(RETRY_DELAY)
 
     else:
-      print(f"Process {num} completed successfully.")
+      #print(f"Process {num} completed successfully.")
       return # Exit on success
           
     finally:
@@ -199,6 +199,8 @@ def process_directory(directory_path, remote_directory, remote_host, username):
   # Wait for all file processes to finish
   for process in file_processes:
     process.join()
+
+  #TODO: report success / fail for entire process -- list failed files?  retry them? 
 
   print("Completed transferring all files in directory.")
 
