@@ -97,10 +97,10 @@ def remote_file_exists_and_matches_size(remote_host, username, remote_path, loca
       return False
 
   except SFTPError:
-    print(f"Remote file does not exist: {remote_path}")
+    # print(f"Remote file does not exist: {remote_path}")
     return False
   except Exception as e:
-    print(f"Error while checking remote file: {e}")
+    # print(f"Error while checking remote file: {e}")
     return False
   finally:
     sftp.close()
@@ -169,7 +169,72 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
   print(f"Process {num} failed after {MAX_RETRIES} attempts.")
 
 
-def process_file(file_path, remote_directory, remote_host, username, progress_queue, position):
+def process_file(file_path, remote_directory, remote_host, username, progress_queue, position, status_dict):
+  """
+  Processes a single file by dividing it into parts, transferring each part concurrently,
+  and validating the file size after transfer. Skips files that already exist and match the local size.
+  Records the status of the transfer in a shared dictionary.
+  """
+  file_name = os.path.basename(file_path)
+  remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
+  total_size = os.path.getsize(file_path)
+
+  # Check if the file exists and matches size on the remote server
+  if remote_file_exists_and_matches_size(remote_host, username, remote_file_path, file_path):
+    status_dict[file_name] = "Skipped"
+    print(f"{file_name} already exists at remote path and size matches. Skipping.")
+    return # Skip transfer if the file already exists and matches size
+
+  # Initialize a progress bar: each file gets a new bar
+  with tqdm(
+    total=total_size,
+    desc=f"Pushing {file_name}",
+    unit="B",
+    unit_scale=True,
+    position=position,
+    leave=True,
+  ) as progress_bar:
+    processes = []
+
+    # Create processes for each part of the file
+    try:
+      for num, offset, part_size in split_file_into_parts(file_path, PARTS_PER_FILE):
+        args = (remote_host, username, remote_file_path, file_path, num, offset, part_size, progress_queue)
+        process = Process(target=upload_part, args=args)
+        processes.append(process)
+        process.start()
+
+      # Update progress bar based on queue
+      transferred_bytes = 0
+      while any(process.is_alive() for process in processes):
+        while not progress_queue.empty():
+          bytes_transferred = progress_queue.get()
+          transferred_bytes += bytes_transferred
+          progress_bar.update(bytes_transferred)
+        time.sleep(0.1) # Small delay to reduce CPU usage
+
+      # Wait for all processes to finish
+      for process in processes:
+        process.join()
+
+      # Ensure the progress bar reaches 100%
+      if transferred_bytes < total_size:
+        progress_bar.update(total_size - transferred_bytes)
+
+      # Validate file size
+      if validate_file_size(remote_host, username, remote_file_path, file_path):
+        status_dict[file_name] = "Transferred"
+        print(f"File {file_name} successfully transferred and validated.")
+      else:
+        status_dict[file_name] = "Failed"
+        print(f"File {file_name} transfer validation failed.")
+
+    except Exception as e:
+      status_dict[file_name] = "Failed"
+      print(f"Error processing file {file_name}: {e}")
+
+
+def process_file_WORKS(file_path, remote_directory, remote_host, username, progress_queue, position):
   """
   Processes a single file by dividing it into parts, transferring each part concurrently,
   and validating the file size after transfer.
@@ -230,11 +295,12 @@ def process_directory(directory_path, remote_directory, remote_host, username):
   """Recursively processes all files in the specified directory with a limited number of concurrent processes."""
   manager = Manager()
   progress_queue = manager.Queue()
+  status_dict = manager.dict() # Shared dictionary for transfer statuses
 
-  def process_file_wrapper(file_path, remote_directory, remote_host, username, progress_queue, position):
+  def process_file_wrapper(file_path, remote_directory, remote_host, username, progress_queue, position, status_dict):
     """Wrapper to acquire and release semaphore for file processing."""
-    with process_semaphore: # Limit the number of concurrent files being processed
-      process_file(file_path, remote_directory, remote_host, username, progress_queue, position)
+    with process_semaphore: # Limit the number of concurrent processes
+      process_file(file_path, remote_directory, remote_host, username, progress_queue, position, status_dict)
 
   file_processes = []
   position = 0 # Initialize position for progress bars
@@ -252,7 +318,7 @@ def process_directory(directory_path, remote_directory, remote_host, username):
         # Start a process with a semaphore-wrapped function
         process = Process(
           target=process_file_wrapper,
-          args=(file_path, current_remote_dir, remote_host, username, progress_queue, position),
+          args=(file_path, current_remote_dir, remote_host, username, progress_queue, position, status_dict),
         )
         file_processes.append(process)
         process.start()
@@ -262,9 +328,22 @@ def process_directory(directory_path, remote_directory, remote_host, username):
   for process in file_processes:
     process.join()
 
-  #TODO: report success / fail for entire process -- list failed files?  retry them? 
+  print("Completed transferring all files in directory.")
+  summarize_transfer_status(status_dict)
 
-  print("\nCompleted transferring all files in directory.")
+
+def summarize_transfer_status(status_dict):
+    """
+    Prints a summary of the file transfer statuses.
+
+    Args:
+        status_dict (dict): A dictionary containing the status of each file transfer.
+    """
+    print("\nTransfer Summary:")
+    print("-" * 50)
+    for file_name, status in status_dict.items():
+        print(f"{file_name}: {status}")
+    print("-" * 50)
 
 
 def main():
