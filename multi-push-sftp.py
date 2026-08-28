@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Manager, Semaphore
@@ -108,7 +109,7 @@ def split_file_into_parts(file_path, num_parts):
 
 
 def upload_part(remote_host, username, remote_path, local_path, num, offset, part_size, progress_queue, connection_semaphore):
-    """Worker task uploading a specific chunk of a file using SFTP with retry logic."""
+    """Worker task uploading a specific chunk of a file using SFTP with jittered backoff retry logic."""
     attempt = 0
     while attempt < MAX_RETRIES:
         ssh = None
@@ -144,8 +145,17 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
 
         except (ssh_exception.SSHException, SFTPError, OSError) as e:
             attempt += 1
-            print(f"[Part {num}] Error uploading {os.path.basename(local_path)} (Attempt {attempt}/{MAX_RETRIES}): {e}")
-            time.sleep(RETRY_DELAY)
+            # Calculate backoff with exponential scaling + randomized jitter (1.0 to 5.0 seconds)
+            # This prevents multiple workers from hammering SSH banner exchanges simultaneously
+            jitter = random.uniform(1.0, 5.0)
+            backoff_delay = (RETRY_DELAY * attempt) + jitter
+
+            print(
+                f"[Part {num}] Connection/SFTP error uploading {os.path.basename(local_path)} "
+                f"(Attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in {backoff_delay:.1f}s..."
+            )
+            time.sleep(backoff_delay)
+
         finally:
             if sftp:
                 try:
@@ -158,7 +168,7 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
                 except Exception:
                     pass
 
-    print(f"[Part {num}] Hard failure: Failed to upload after {MAX_RETRIES} attempts.")
+    print(f"[Part {num}] Hard failure: Failed to upload {os.path.basename(local_path)} after {MAX_RETRIES} attempts.")
     return False
 
 
