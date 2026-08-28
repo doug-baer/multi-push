@@ -5,9 +5,10 @@ import argparse
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager, Semaphore
+from multiprocessing import Manager, Process
 from paramiko import SSHClient, AutoAddPolicy, ssh_exception, SFTPError
 from tqdm import tqdm
+from queue import Empty
 
 # Configuration Defaults
 SSH_PORT = 22
@@ -194,32 +195,33 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
     # 1. Check if remote file exists and size already matches
     remote_size = get_remote_file_size(remote_host, username, remote_file_path, connection_semaphore)
     if remote_size == total_size:
-        print(f"[Skip] {file_name} already matches target size ({total_size} bytes).")
+        print(f"[Skip] {file_name} matches target size ({total_size} bytes).")
         return True
 
-    # 2. Pre-create target file stub cleanly in parent process space
+    # 2. Pre-create target file stub
     if not create_remote_file_stub(remote_host, username, remote_file_path, connection_semaphore):
         print(f"[Fail] Could not initialize remote file stub for {file_name}.")
         return False
 
-    # 3. Determine dynamic stream count based on file size
+    # 3. Determine dynamic stream count and launch chunk processes directly (no nested executors)
     parts_per_file = determine_parts_per_file(total_size)
     parts = list(split_file_into_parts(file_path, parts_per_file))
-    
-    with tqdm(
+
+    progress_bar = tqdm(
         total=total_size,
-        desc=f"Pushing {file_name[:20]} ({parts_per_file} streams)",
+        desc=f"Pushing {file_name[:20]} ({parts_per_file} str)",
         unit="B",
         unit_scale=True,
         position=position,
         leave=False,
-    ) as progress_bar:
-        
-        # Parallel execution scaled to dynamic stream count
-        with ProcessPoolExecutor(max_workers=parts_per_file) as chunk_executor:
-            futures = [
-                chunk_executor.submit(
-                    upload_part,
+    )
+
+    try:
+        processes = []
+        for num, offset, part_size in parts:
+            p = Process(
+                target=upload_part,
+                args=(
                     remote_host,
                     username,
                     remote_file_path,
@@ -229,32 +231,42 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
                     part_size,
                     progress_queue,
                     connection_semaphore,
-                )
-                for num, offset, part_size in parts
-            ]
+                ),
+            )
+            processes.append(p)
+            p.start()
 
-            # Drain queue updates into progress bar until chunks complete
-            transferred_bytes = 0
-            while any(f.running() for f in futures):
-                while not progress_queue.empty():
-                    bytes_added = progress_queue.get()
-                    transferred_bytes += bytes_added
+        # Non-blocking progress queue drain while processes run
+        while any(p.is_alive() for p in processes):
+            while True:
+                try:
+                    bytes_added = progress_queue.get_nowait()  # Safe non-blocking read
                     progress_bar.update(bytes_added)
-                time.sleep(0.05)
+                except Empty:
+                    break
+            time.sleep(0.05)
 
-            # Ensure final queue items are drained
-            while not progress_queue.empty():
-                bytes_added = progress_queue.get()
-                transferred_bytes += bytes_added
+        # Final queue drain after processes complete
+        while True:
+            try:
+                bytes_added = progress_queue.get_nowait()
                 progress_bar.update(bytes_added)
+            except Empty:
+                break
 
-            chunk_results = [f.result() for f in as_completed(futures)]
+        # Wait for all processes to terminate cleanly
+        for p in processes:
+            p.join()
 
-    if not all(chunk_results):
-        print(f"[Error] One or more chunks failed for file: {file_name}")
-        return False
+        # Check if all processes completed with exitcode 0
+        if any(p.exitcode != 0 for p in processes):
+            print(f"[Error] One or more chunk processes failed for file: {file_name}")
+            return False
 
-    # 4. Final Verification
+    finally:
+        progress_bar.close()
+
+    # 4. Final Size Verification
     final_remote_size = get_remote_file_size(remote_host, username, remote_file_path, connection_semaphore)
     if final_remote_size == total_size:
         return True
@@ -264,33 +276,34 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
 
 
 def process_directory(directory_path, remote_directory, remote_host, username, max_connections):
+    """Walks directory, sets up remote folder tree, and executes transfers with explicit manager cleanup."""
     manager = Manager()
-    progress_queue = manager.Queue()
-    connection_semaphore = manager.Semaphore(max_connections)
-
-    file_tasks = []
-
-    print("Scanning directory tree and creating remote paths...")
-    for root, _, files in os.walk(directory_path):
-        relative_path = os.path.relpath(root, directory_path)
-        current_remote_dir = (
-            remote_directory if relative_path == "." 
-            else os.path.join(remote_directory, relative_path).replace("\\", "/")
-        )
-
-        ensure_remote_dir(remote_host, username, current_remote_dir, connection_semaphore)
-
-        for file_name in files:
-            file_path = os.path.join(root, file_name)
-            if os.path.isfile(file_path):
-                file_tasks.append((file_path, current_remote_dir))
-
-    print(f"Found {len(file_tasks)} files. Submitting to worker pool...")
-
-    successful = 0
-    failed = 0
-
     try:
+        progress_queue = manager.Queue()
+        connection_semaphore = manager.Semaphore(max_connections)
+
+        file_tasks = []
+
+        print("Scanning directory tree and creating remote paths...")
+        for root, _, files in os.walk(directory_path):
+            relative_path = os.path.relpath(root, directory_path)
+            current_remote_dir = (
+                remote_directory if relative_path == "."
+                else os.path.join(remote_directory, relative_path).replace("\\", "/")
+            )
+
+            ensure_remote_dir(remote_host, username, current_remote_dir, connection_semaphore)
+
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                if os.path.isfile(file_path):
+                    file_tasks.append((file_path, current_remote_dir))
+
+        print(f"Found {len(file_tasks)} files. Submitting to worker pool...")
+
+        successful = 0
+        failed = 0
+
         with ProcessPoolExecutor(max_workers=MAX_CONCURRENT_FILES) as file_executor:
             futures = {
                 file_executor.submit(
@@ -301,7 +314,7 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
                     username,
                     progress_queue,
                     idx % MAX_CONCURRENT_FILES,
-                    connection_semaphore  # <-- Passed semaphore & queue directly, NO manager object
+                    connection_semaphore,
                 ): file_path
                 for idx, (file_path, remote_dir) in enumerate(file_tasks)
             }
@@ -318,15 +331,18 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
                     print(f"Unhandled exception processing {path}: {e}")
                     failed += 1
 
+        print("\n================ Transfer Summary ================")
+        print(f"Total Files Handled: {len(file_tasks)}")
+        print(f"Successfully Processed/Verified: {successful}")
+        print(f"Failed Transfers: {failed}")
+        print("==================================================")
+
     except KeyboardInterrupt:
         print("\n[Terminated] KeyboardInterrupt received. Aborting transfers...")
         sys.exit(1)
-
-    print("\n================ Transfer Summary ================")
-    print(f"Total Files Handled: {len(file_tasks)}")
-    print(f"Successfully Processed/Verified: {successful}")
-    print(f"Failed Transfers: {failed}")
-    print("==================================================")
+    finally:
+        # Explicitly shut down the Manager process to prevent hanging on exit
+        manager.shutdown()
 
 
 def main():
