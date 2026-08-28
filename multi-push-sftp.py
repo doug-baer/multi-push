@@ -162,8 +162,7 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
     return False
 
 
-def process_file(file_path, remote_directory, remote_host, username, progress_queue, position, connection_semaphore, manager):
-    """Handles checking, staging, parallel chunk execution, and post-transfer verification for a single file."""
+def process_file(file_path, remote_directory, remote_host, username, progress_queue, position, connection_semaphore):
     file_name = os.path.basename(file_path)
     remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
     total_size = os.path.getsize(file_path)
@@ -240,14 +239,12 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
 
 
 def process_directory(directory_path, remote_directory, remote_host, username, max_connections):
-    """Walks directory, sets up remote folder tree, and uses a Managed Process Pool to execute files."""
     manager = Manager()
     progress_queue = manager.Queue()
     connection_semaphore = manager.Semaphore(max_connections)
 
     file_tasks = []
 
-    # Map local files and make remote directories upfront
     print("Scanning directory tree and creating remote paths...")
     for root, _, files in os.walk(directory_path):
         relative_path = os.path.relpath(root, directory_path)
@@ -256,7 +253,6 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
             else os.path.join(remote_directory, relative_path).replace("\\", "/")
         )
 
-        # Ensure directory exists on target remote host
         ensure_remote_dir(remote_host, username, current_remote_dir, connection_semaphore)
 
         for file_name in files:
@@ -264,12 +260,11 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
             if os.path.isfile(file_path):
                 file_tasks.append((file_path, current_remote_dir))
 
-    print(f"Found {len(file_tasks)} files. Submitting to worker pool (Max Connections: {max_connections})...")
+    print(f"Found {len(file_tasks)} files. Submitting to worker pool...")
 
     successful = 0
     failed = 0
 
-    # Execute files safely in a managed Process Pool without unbounded process generation
     try:
         with ProcessPoolExecutor(max_workers=MAX_CONCURRENT_FILES) as file_executor:
             futures = {
@@ -281,8 +276,7 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
                     username,
                     progress_queue,
                     idx % MAX_CONCURRENT_FILES,
-                    connection_semaphore,
-                    manager,
+                    connection_semaphore  # <-- Passed semaphore & queue directly, NO manager object
                 ): file_path
                 for idx, (file_path, remote_dir) in enumerate(file_tasks)
             }
