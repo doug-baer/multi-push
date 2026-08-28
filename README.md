@@ -1,32 +1,109 @@
 # multi-push
-pushing files via SFTP using multiple streams per file
 
-This is an experimental project to explore supporting multi-stream "push" of large files from a client to a server by breaking the source file into chunks and then uploading those chunks in parallel into the proper region within a file on the target machine.  Due to support for uploading to a specific offset within a file (supported since OpenSSH v9.0?), this should be possible. You can use seekable() in the Paramiko (https://www.paramiko.org/) library to see if it is supported for your connection.
+**`multi-push`** is a high-performance, multi-process SFTP directory synchronization tool written in Python. It overcomes standard single-threaded SSH/SFTP speed limits—such as the TCP Bandwidth-Delay Product (BDP) bottleneck on high-latency WAN links—by splitting large files into parallel chunks and uploading multiple files simultaneously.
 
-Consider this a proof of concept and it sort of works but should not be used for production/critical work. I have built in some basic retry of the SSH connections and a rudimentary validation that the file size on the remote matches the size of the source, but that is no substitute for checking hashes -- though that takes significantly more time for big files. 
+Designed for reliability and efficiency, `multi-push` includes strict global connection throttling to prevent overwhelming target SSH servers.
 
-Small files give it some challenges as the progress bars do not know what to do and often do not show 100% even though the files have moved in a blink. The focus is large files, so I'll have to deal with that later. I tried to implement a "go to 100%" logic, but it may not do what I want. 
+---
 
-Example command line
+## Key Features
+
+- **Dynamic Stream Scaling:** Automatically adjusts parallel stream counts based on file size:
+  - **Small Files (< 50 MB):** 1 stream (minimizes SSH connection handshake overhead).
+  - **Medium Files (50 MB – 1 GB):** 4 parallel chunk streams.
+  - **Large Files (> 1 GB):** 16 parallel chunk streams.
+- **Global Connection Throttling:** Enforces a configurable ceiling on simultaneous active SSH/SFTP connections (default: 100 max connections) using IPC semaphores.
+- **Handshake Pacing & Burst Prevention:** Staggers new SSH connection attempts to prevent target server `sshd` rate-limiting drops (`MaxStartups` drops and `Errno 104 Connection reset by peer`).
+- **Skip & Resume Verification:** Queries remote file sizes before transfers to skip existing files and verify integrity post-transfer.
+- **Recursive Directory Staging:** Automatically builds missing nested directory structures on the target server (`mkdir -p` behavior).
+- **Jittered Backoff & Retry:** Built-in retry mechanism using exponential backoff with randomized timing jitter to handle intermittent network drops cleanly.
+- **Clean Terminal Progress UI:** Powered by `tqdm` with non-corrupting terminal updates and deadlock-free multiprocessing queue draining.
+
+---
+
+## Prerequisites
+
+- **Python:** Version 3.8 or higher.
+- **Remote Host:** Standard SFTP/SSH access enabled on the target host.
+
+---
+
+## Installation
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/doug-baer/multi-push.git
+   cd multi-push
+   ```
+
+2. **Create and Activate a Virtual Environment:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install Dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+---
+
+## Usage
+
+Run the script from your terminal by specifying local and remote directory paths and host authentication details:
+
+```bash
+python3 multi_push.py \
+  --directory_path /path/to/local/data \
+  --remote_host sftp.example.com \
+  --username your_user \
+  --remote_directory /path/to/remote/target
 ```
-./multi-push-sftp.py  --remote_host lvn-cat --username hol-mgr --directory_path /hol/lib/my-vpod   --remote_directory /hol/lib/my-vpod-copy
+
+### Command Line Arguments
+
+| Argument | Required | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--directory_path` | **Yes** | — | Local directory path to synchronize. |
+| `--remote_host` | **Yes** | — | Hostname or IP address of the target SFTP server. |
+| `--username` | **Yes** | — | SSH/SFTP username. |
+| `--remote_directory` | **Yes** | — | Remote base target directory path. |
+| `--max_connections` | No | `100` | Global maximum simultaneous SSH connections ceiling. |
+
+### Example with Connection Throttling
+
+To limit the tool to a lower connection limit (e.g., 30 max connections on more restrictive servers):
+
+```bash
+python3 multi_push.py \
+  --directory_path ./my_dataset \
+  --remote_host 192.168.1.50 \
+  --username admin \
+  --remote_directory /backups/dataset \
+  --max_connections 30
 ```
 
-It uses key-based SSH, which must be setup in advance between the source and target -- and the source must be able to SSH into the target (port 22 is hardcoded into the script, but is a constant at the top and can easily be changed to match the environment.)
+---
 
-NOTE: By default, OpenSSH on Ubuntu can handle a significant number of simultaneous connections, but reaching, say, 100 concurrent connections will require adjustments to the configuration file (/etc/ssh/sshd_config) to ensure optimal performance and avoid potential issues with resource limitations on the server -- like exhaustion of available SSH connections. 
+## Server Optimization Tip (`sshd_config`)
 
-Configuration Parameter: The primary setting to control the maximum connections is called "MaxStartups" within the sshd_config file.
-Default Value: "MaxStartups" is usually set to a lower number (around 10), which might not be sufficient for handling 100 simultaneous connections.
+If you have administrative access on the target host and plan to run high connection counts (`--max_connections 100`), ensure the remote host's OpenSSH daemon is configured to handle concurrent unauthenticated connection bursts.
 
-Recommendation: adjust this value to 100 -- or something that will accommodate the number of connections that you require. The number of connections is the number of simultaneous files multiplied by the number of simultaneous "chunks," with a buffer to account for connections starting before the others are completely closed and cleaned up. (This script is configured for 3 chunks per file and 2 concurrent files as I work on tweaking the server side.)
+Edit `/etc/ssh/sshd_config` on the remote server:
 
-The MaxStartups parameter in OpenSSH specifies the maximum number of concurrent unauthenticated connections to the SSH daemon: 
-Default value: 10:30:100 (or, in some versions, 10:30:60)
+```text
+MaxStartups 100:30:200
+MaxSessions 100
+```
 
-How it works: When the number of unauthenticated connections reaches the MaxStartups value, the server will drop new connection requests at a rate that increases linearly. For example, if the MaxStartups value is 10:30:100, the server will drop connection attempts with a 30% probability if there are 10 unauthenticated connections. 
+Then restart SSH service:
+```bash
+sudo systemctl restart sshd
+```
 
-How to configure: To configure MaxStartups, you can add or adjust the line MaxStartups in the /etc/ssh/sshd_config file. 
+---
 
+## License
 
-November 22, 2024
+Distributed under the MIT License. See `LICENSE` for details.
