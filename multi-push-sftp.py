@@ -1,286 +1,334 @@
 #!/usr/bin/env python3
 import os
+import sys
 import argparse
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Manager, Semaphore
 from paramiko import SSHClient, AutoAddPolicy, ssh_exception, SFTPError
 from tqdm import tqdm
-from multiprocessing import Process, Semaphore, Manager, current_process
 
-# Configuration
+# Configuration Defaults
 SSH_PORT = 22
-PARTS_PER_FILE = 4 # Number of processes to handle file parts
-MAX_RETRIES = 5 # Maximum number of retries for failed SSH/SFTP connections
-RETRY_DELAY = 60 # Delay in seconds between retries
-MAX_PROCESSES = 2 # Limit on concurrent file-processing processes
+PARTS_PER_FILE = 4       # Number of chunks to split each file into
+MAX_RETRIES = 5          # Maximum connection retry attempts
+RETRY_DELAY = 10         # Seconds to wait between retries
+MAX_CONCURRENT_FILES = 4 # Maximum files being transferred simultaneously
+MAX_CONNECTIONS = 100    # Maximum simultaneous SSH/SFTP sessions globally
 
-# Semaphores to limit the number of concurrent processes
-file_semaphore = Semaphore(1)
-process_semaphore = Semaphore(MAX_PROCESSES)
 
-# Track whether the remote file has been created
-created = False
+def get_remote_file_size(remote_host, username, remote_path, connection_semaphore):
+    """
+    Attempts to fetch the size of a remote file via SFTP.
+    Returns size in bytes if file exists, or None if it doesn't exist or errors.
+    """
+    ssh = None
+    sftp = None
+    with connection_semaphore:
+        try:
+            ssh = SSHClient()
+            ssh.set_missing_host_key_policy(AutoAddPolicy())
+            ssh.connect(remote_host, port=SSH_PORT, username=username, timeout=15)
+            sftp = ssh.open_sftp()
+            return sftp.stat(remote_path).st_size
+        except (SFTPError, FileNotFoundError):
+            return None
+        except Exception as e:
+            print(f"[Warning] Failed checking remote size for {remote_path}: {e}")
+            return None
+        finally:
+            if sftp:
+                sftp.close()
+            if ssh:
+                ssh.close()
 
-# TODO: Track total transfer success
-successful_transfer = True
+
+def ensure_remote_dir(remote_host, username, remote_dir, connection_semaphore):
+    """Recursively creates remote directories on the SFTP server (mkdir -p)."""
+    ssh = None
+    sftp = None
+    dirs = remote_dir.strip("/").split("/")
+    current_dir = ""
+
+    with connection_semaphore:
+        try:
+            ssh = SSHClient()
+            ssh.set_missing_host_key_policy(AutoAddPolicy())
+            ssh.connect(remote_host, port=SSH_PORT, username=username, timeout=15)
+            sftp = ssh.open_sftp()
+
+            for folder in dirs:
+                current_dir += "/" + folder
+                try:
+                    sftp.stat(current_dir)
+                except FileNotFoundError:
+                    sftp.mkdir(current_dir)
+        except Exception as e:
+            print(f"[Error] Failed creating directory structure {remote_dir}: {e}")
+        finally:
+            if sftp:
+                sftp.close()
+            if ssh:
+                ssh.close()
+
+
+def create_remote_file_stub(remote_host, username, remote_path, connection_semaphore):
+    """Creates/truncates remote destination file once before multi-process writing begins."""
+    ssh = None
+    sftp = None
+    with connection_semaphore:
+        try:
+            ssh = SSHClient()
+            ssh.set_missing_host_key_policy(AutoAddPolicy())
+            ssh.connect(remote_host, port=SSH_PORT, username=username, timeout=15)
+            sftp = ssh.open_sftp()
+            # Truncate/create empty file
+            with sftp.open(remote_path, "w") as f:
+                f.truncate(0)
+            return True
+        except Exception as e:
+            print(f"[Error] Failed initializing remote file {remote_path}: {e}")
+            return False
+        finally:
+            if sftp:
+                sftp.close()
+            if ssh:
+                ssh.close()
+
 
 def split_file_into_parts(file_path, num_parts):
-  """Yield parts of a file, dividing it by the number of threads."""
-  file_size = os.path.getsize(file_path)
-  part_size = file_size // num_parts
-  for i in range(num_parts):
-    offset = i * part_size
-    if i == num_parts - 1:
-      part_size = file_size - offset # Last part gets the remainder
-    yield i, offset, part_size
+    """Yields (part_number, offset, part_size) chunks for a local file."""
+    file_size = os.path.getsize(file_path)
+    part_size = file_size // num_parts
+    for i in range(num_parts):
+        offset = i * part_size
+        if i == num_parts - 1:
+            part_size = file_size - offset  # Remainder added to last chunk
+        yield i, offset, part_size
 
 
-def validate_file_size(remote_host, username, remote_path, local_path):
-  """
-  Validates that the remote file size matches the local file size.
-  """
-  local_size = os.path.getsize(local_path)
-  try:
-    ssh = SSHClient()
-    ssh.set_missing_host_key_policy(AutoAddPolicy())
-    ssh.connect(remote_host, port=SSH_PORT, username=username)
+def upload_part(remote_host, username, remote_path, local_path, num, offset, part_size, progress_queue, connection_semaphore):
+    """Worker task uploading a specific chunk of a file using SFTP with retry logic."""
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        ssh = None
+        sftp = None
+        try:
+            # Acquire slot from global connection pool before creating SSH session
+            with connection_semaphore:
+                ssh = SSHClient()
+                ssh.set_missing_host_key_policy(AutoAddPolicy())
+                ssh.connect(remote_host, port=SSH_PORT, username=username, timeout=20)
+                sftp = ssh.open_sftp()
 
-    sftp = ssh.open_sftp()
-    remote_size = sftp.stat(remote_path).st_size
+                with open(local_path, "rb") as local_file:
+                    local_file.seek(offset)
+                    # Open remote file in read-write mode (must already exist)
+                    with sftp.open(remote_path, "r+") as remote_file:
+                        remote_file.seek(offset)
+                        remote_file.set_pipelined(True)
 
-    if local_size == remote_size:
-      #print(f"Validation successful: {local_path} ({local_size} bytes) matches {remote_path} ({remote_size} bytes).")
-      return True
-    else:
-      print(f"Validation failed: {local_path} ({local_size} bytes) does not match {remote_path} ({remote_size} bytes).")
-      return False
+                        size_uploaded = 0
+                        while size_uploaded < part_size:
+                            buffer_size = min(32768, part_size - size_uploaded)
+                            data = local_file.read(buffer_size)
+                            if not data:
+                                break
 
-  except ssh_exception.SSHException as e:
-    print(f"Validation failed due to SSHException: {e}")
+                            remote_file.write(data)
+                            size_uploaded += len(data)
+                            progress_queue.put(len(data))
+
+            # Exit retry loop on successful upload completion
+            return True
+
+        except (ssh_exception.SSHException, SFTPError, OSError) as e:
+            attempt += 1
+            print(f"[Part {num}] Error uploading {os.path.basename(local_path)} (Attempt {attempt}/{MAX_RETRIES}): {e}")
+            time.sleep(RETRY_DELAY)
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            if ssh:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+
+    print(f"[Part {num}] Hard failure: Failed to upload after {MAX_RETRIES} attempts.")
     return False
-  
-  finally:
-   sftp.close()
-   ssh.close()
 
 
-def remote_file_exists_and_matches_size(remote_host, username, remote_path, local_path):
-  """
-  Checks if a file exists on the remote server and matches the size of the local file.
-  (duplicates function of validate_file_size ... can we collapse them into one function?)
+def process_file(file_path, remote_directory, remote_host, username, progress_queue, position, connection_semaphore, manager):
+    """Handles checking, staging, parallel chunk execution, and post-transfer verification for a single file."""
+    file_name = os.path.basename(file_path)
+    remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
+    total_size = os.path.getsize(file_path)
 
-  Args:
-    remote_host (str): The hostname or IP address of the remote server.
-    username (str): The username for the remote server.
-    remote_path (str): The full path of the file on the remote server.
-    local_path (str): The full path of the local file.
+    # 1. Check if remote file exists and size already matches
+    remote_size = get_remote_file_size(remote_host, username, remote_file_path, connection_semaphore)
+    if remote_size == total_size:
+        print(f"[Skip] {file_name} already matches target size ({total_size} bytes).")
+        return True
 
-  Returns:
-    bool: True if the file exists and matches the size, False otherwise.
-  """
-  local_size = os.path.getsize(local_path)
-  try:
-    ssh = SSHClient()
-    ssh.set_missing_host_key_policy(AutoAddPolicy())
-    ssh.connect(remote_host, port=22, username=username)
+    # 2. Pre-create target file stub cleanly in parent process space
+    if not create_remote_file_stub(remote_host, username, remote_file_path, connection_semaphore):
+        print(f"[Fail] Could not initialize remote file stub for {file_name}.")
+        return False
 
-    # Open SFTP session
-    sftp = ssh.open_sftp()
+    # 3. Process chunk transfers using inner pool
+    parts = list(split_file_into_parts(file_path, PARTS_PER_FILE))
+    
+    with tqdm(
+        total=total_size,
+        desc=f"Pushing {file_name[:20]}",
+        unit="B",
+        unit_scale=True,
+        position=position,
+        leave=False,
+    ) as progress_bar:
+        
+        # Parallel execution of file chunks
+        with ProcessPoolExecutor(max_workers=PARTS_PER_FILE) as chunk_executor:
+            futures = [
+                chunk_executor.submit(
+                    upload_part,
+                    remote_host,
+                    username,
+                    remote_file_path,
+                    file_path,
+                    num,
+                    offset,
+                    part_size,
+                    progress_queue,
+                    connection_semaphore,
+                )
+                for num, offset, part_size in parts
+            ]
 
-    # Check remote file size
-    remote_size = sftp.stat(remote_path).st_size
+            # Drain queue updates into progress bar until chunks complete
+            transferred_bytes = 0
+            while any(f.running() for f in futures):
+                while not progress_queue.empty():
+                    bytes_added = progress_queue.get()
+                    transferred_bytes += bytes_added
+                    progress_bar.update(bytes_added)
+                time.sleep(0.05)
 
-    if remote_size == local_size:
-      print(f"Remote file matches size: {remote_path} ({remote_size} bytes). Skipping transfer.")
-      return True
+            # Ensure final queue items are drained
+            while not progress_queue.empty():
+                bytes_added = progress_queue.get()
+                transferred_bytes += bytes_added
+                progress_bar.update(bytes_added)
+
+            chunk_results = [f.result() for f in as_completed(futures)]
+
+    if not all(chunk_results):
+        print(f"[Error] One or more chunks failed for file: {file_name}")
+        return False
+
+    # 4. Final Verification
+    final_remote_size = get_remote_file_size(remote_host, username, remote_file_path, connection_semaphore)
+    if final_remote_size == total_size:
+        return True
     else:
-      print(f"Remote file exists but size differs: {remote_path} ({remote_size} bytes vs {local_size} bytes).")
-      return False
-
-  except SFTPError:
-    print(f"Remote file does not exist: {remote_path}")
-    return False
-  except Exception as e:
-    print(f"Error while checking remote file: {e}")
-    return False
-  finally:
-    sftp.close()
-    ssh.close()
+        print(f"[Validation Failed] {file_name} final size mismatch. Expected {total_size}, got {final_remote_size}.")
+        return False
 
 
-def upload_part(remote_host, username, remote_path, local_path, num, offset, part_size, progress_queue):
-  """
-  Uploads a specific part of the file to the remote host using SFTP.
-  Opens a new SSH session for the part (reusing is not threadsafe)
-  Includes retry logic for SSH/SFTP connection failures.
-  """
-  global created
-  attempt = 0
+def process_directory(directory_path, remote_directory, remote_host, username, max_connections):
+    """Walks directory, sets up remote folder tree, and uses a Managed Process Pool to execute files."""
+    manager = Manager()
+    progress_queue = manager.Queue()
+    connection_semaphore = manager.Semaphore(max_connections)
 
-  while attempt < MAX_RETRIES:
-    try:
-      # print(f"Process {num} attempting SSH connection (Attempt {attempt + 1})")
-      ssh = SSHClient()
-      ssh.set_missing_host_key_policy(AutoAddPolicy())
-      ssh.connect(remote_host, port=SSH_PORT, username=username)
+    file_tasks = []
 
-      sftp = ssh.open_sftp()
-      with open(local_path, "rb") as local_file:
-        local_file.seek(offset) # Seek to the correct file offset in local file
-        if not created:
-          with file_semaphore:
-            if not created: # check whether the file exists
-              mode = "w"
-              created = True
-            else:
-              mode = "r+"
-        else:
-          mode = "r+"
-
-        with sftp.open(remote_path, mode) as remote_file:
-          remote_file.seek(offset) # Seek to the correct file offset on remote
-          remote_file.set_pipelined(True) # Enable pipelining for performance
-
-          size_uploaded = 0
-          while size_uploaded < part_size:
-            buffer_size = min(32768, part_size - size_uploaded) # Limit buffer size
-            data = local_file.read(buffer_size)
-            if not data:
-              break # End if no data is left to read
-
-            remote_file.write(data) # Write the buffer to remote file
-            size_uploaded += len(data)
-
-            # Update progress
-            progress_queue.put(len(data))
-
-    except ssh_exception.SSHException as e:
-      attempt += 1
-      print(f"Process {num} failed (Attempt {attempt}/{MAX_RETRIES}). Error: {e}")
-      time.sleep(RETRY_DELAY)
-
-    else:
-      #print(f"Process {num} completed successfully.")
-      return # Exit on success
-          
-    finally:
-      sftp.close()
-      ssh.close() # always close the connection
-
-  print(f"Process {num} failed after {MAX_RETRIES} attempts.")
-
-
-def process_file(file_path, remote_directory, remote_host, username, progress_queue, position):
-  """
-  Processes a single file by dividing it into parts, transferring each part concurrently,
-  and validating the file size after transfer.
-  """
-  file_name = os.path.basename(file_path)
-  remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
-  total_size = os.path.getsize(file_path)
-
-  # Check if the file exists and matches size on the remote server
-  if remote_file_exists_and_matches_size(remote_host, username, remote_file_path, file_path):
-    print(f"{file_name} already exists at remote path and size matches. Skipping.")
-    return  # Skip transfer if the file already exists and matches size
-
-  # Initialize a progress bar: each file gets a new bar
-  with tqdm(
-    total=total_size,
-    desc=f"Pushing {file_name}",
-    unit="B",
-    unit_scale=True,
-    position=position,
-    leave=True,
-  ) as progress_bar:
-    processes = []
-
-    # Create processes for each part of the file
-    for num, offset, part_size in split_file_into_parts(file_path, PARTS_PER_FILE):
-      args = (remote_host, username, remote_file_path, file_path, num, offset, part_size, progress_queue)
-      process = Process(target=upload_part, args=args)
-      processes.append(process)
-      process.start()
-
-    # Update progress bar based on queue
-    transferred_bytes = 0
-    while any(process.is_alive() for process in processes):
-      while not progress_queue.empty():
-        bytes_transferred = progress_queue.get()
-        transferred_bytes += bytes_transferred
-        progress_bar.update(bytes_transferred)
-      time.sleep(0.1) # Small delay to reduce CPU usage
-
-    # Wait for all processes to finish
-    for process in processes:
-      process.join()
-
-    # Ensure the progress bar reaches 100% ? (DB - Not sure this works, especially for small files)
-    if transferred_bytes < total_size:
-      progress_bar.update(total_size - transferred_bytes)
-
-  # Validate file size
-  if not validate_file_size(remote_host, username, remote_file_path, file_path):
-    print(f"File {file_name} transfer validation failed.")
-  #else:
-  #  TODO: update the "files_transerred" table with the result (also, create the files_transferred table based on directory contents)
-  #  print(f"File {file_name} successfully transferred and validated.")
-
-
-def process_directory(directory_path, remote_directory, remote_host, username):
-  """Recursively processes all files in the specified directory with a limited number of concurrent processes."""
-  manager = Manager()
-  progress_queue = manager.Queue()
-
-  def process_file_wrapper(file_path, remote_directory, remote_host, username, progress_queue, position):
-    """Wrapper to acquire and release semaphore for file processing."""
-    with process_semaphore: # Limit the number of concurrent files being processed
-      process_file(file_path, remote_directory, remote_host, username, progress_queue, position)
-
-  file_processes = []
-  position = 0 # Initialize position for progress bars
-
-  for root, _, files in os.walk(directory_path):
-    # Compute the remote directory path based on the current directory structure
-    relative_path = os.path.relpath(root, directory_path)
-    current_remote_dir = os.path.join(remote_directory, relative_path).replace("\\", "/")
-
-    print(f'Current directory: {current_remote_dir}')
-
-    for file_name in files:
-      file_path = os.path.join(root, file_name)
-      if os.path.isfile(file_path):
-        # Start a process with a semaphore-wrapped function
-        process = Process(
-          target=process_file_wrapper,
-          args=(file_path, current_remote_dir, remote_host, username, progress_queue, position),
+    # Map local files and make remote directories upfront
+    print("Scanning directory tree and creating remote paths...")
+    for root, _, files in os.walk(directory_path):
+        relative_path = os.path.relpath(root, directory_path)
+        current_remote_dir = (
+            remote_directory if relative_path == "." 
+            else os.path.join(remote_directory, relative_path).replace("\\", "/")
         )
-        file_processes.append(process)
-        process.start()
-        position += 1 # Increment position for the next file's progress bar
 
-  # Wait for all file processes to finish
-  for process in file_processes:
-    process.join()
+        # Ensure directory exists on target remote host
+        ensure_remote_dir(remote_host, username, current_remote_dir, connection_semaphore)
 
-  #TODO: report success / fail for entire process -- list failed files?  retry them? 
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            if os.path.isfile(file_path):
+                file_tasks.append((file_path, current_remote_dir))
 
-  print("\nCompleted transferring all files in directory.")
+    print(f"Found {len(file_tasks)} files. Submitting to worker pool (Max Connections: {max_connections})...")
+
+    successful = 0
+    failed = 0
+
+    # Execute files safely in a managed Process Pool without unbounded process generation
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_CONCURRENT_FILES) as file_executor:
+            futures = {
+                file_executor.submit(
+                    process_file,
+                    file_path,
+                    remote_dir,
+                    remote_host,
+                    username,
+                    progress_queue,
+                    idx % MAX_CONCURRENT_FILES,
+                    connection_semaphore,
+                    manager,
+                ): file_path
+                for idx, (file_path, remote_dir) in enumerate(file_tasks)
+            }
+
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    res = future.result()
+                    if res:
+                        successful += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    print(f"Unhandled exception processing {path}: {e}")
+                    failed += 1
+
+    except KeyboardInterrupt:
+        print("\n[Terminated] KeyboardInterrupt received. Aborting transfers...")
+        sys.exit(1)
+
+    print("\n================ Transfer Summary ================")
+    print(f"Total Files Handled: {len(file_tasks)}")
+    print(f"Successfully Processed/Verified: {successful}")
+    print(f"Failed Transfers: {failed}")
+    print("==================================================")
 
 
 def main():
-  # Set up argument parser
-  parser = argparse.ArgumentParser(description="Transfer files recursively to an SFTP server.")
-  parser.add_argument("--directory_path", help="Path to the local directory to transfer")
-  parser.add_argument("--remote_host", help="Remote SFTP server hostname")
-  parser.add_argument("--username", help="Username for SFTP server")
-  parser.add_argument("--remote_directory", help="Remote directory path on the SFTP server")
+    parser = argparse.ArgumentParser(description="Multi-threaded chunked SFTP Directory Synchronization.")
+    parser.add_argument("--directory_path", required=True, help="Path to local directory")
+    parser.add_argument("--remote_host", required=True, help="SFTP server host/IP")
+    parser.add_argument("--username", required=True, help="SFTP username")
+    parser.add_argument("--remote_directory", required=True, help="SFTP base target directory")
+    parser.add_argument("--max_connections", type=int, default=MAX_CONNECTIONS, help="Max simultaneous connections (Default: 100)")
 
-  # Parse arguments
-  args = parser.parse_args()
+    args = parser.parse_args()
 
-  # Start processing the directory
-  process_directory(args.directory_path, args.remote_directory, args.remote_host, args.username)
+    process_directory(
+        args.directory_path,
+        args.remote_directory,
+        args.remote_host,
+        args.username,
+        args.max_connections,
+    )
 
 
 if __name__ == "__main__":
-  main()
+    main()
+    
