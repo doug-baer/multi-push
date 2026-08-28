@@ -222,7 +222,7 @@ def upload_part(
             jitter = random.uniform(1.0, 4.0)
             backoff_delay = (RETRY_DELAY * attempt) + jitter
 
-            print(
+            tqdm.write(
                 f"[Part {num}] Connection dropped for {os.path.basename(local_path)} "
                 f"(Attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in {backoff_delay:.1f}s..."
             )
@@ -262,12 +262,12 @@ def process_file(
     # 1. Skip if remote file matches local size
     remote_size = get_remote_file_size(remote_host, username, remote_file_path, connection_semaphore, connect_lock)
     if remote_size == total_size:
-        print(f"[Skip] {file_name} matches target size ({total_size} bytes).")
+        tqdm.write(f"[Skip] {file_name} matches target size ({total_size} bytes).")
         return True
 
     # 2. Pre-create target file stub
     if not create_remote_file_stub(remote_host, username, remote_file_path, connection_semaphore, connect_lock):
-        print(f"[Fail] Could not initialize remote file stub for {file_name}.")
+        tqdm.write(f"[Fail] Could not initialize remote file stub for {file_name}.")
         return False
 
     # 3. Determine stream count & execute chunks cleanly
@@ -326,10 +326,11 @@ def process_file(
             p.join()
 
         if any(p.exitcode != 0 for p in processes):
-            print(f"[Error] One or more chunk processes failed for file: {file_name}")
+            tqdm.write(f"[Error] One or more chunk processes failed for file: {file_name}")
             return False
 
     finally:
+        progress_bar.clear()
         progress_bar.close()
 
     # 4. Final Verification
@@ -337,7 +338,7 @@ def process_file(
     if final_remote_size == total_size:
         return True
     else:
-        print(f"[Validation Failed] {file_name} size mismatch. Expected {total_size}, got {final_remote_size}.")
+        tqdm.write(f"[Validation Failed] {file_name} size mismatch. Expected {total_size}, got {final_remote_size}.")
         return False
 
 
@@ -367,7 +368,7 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
                 if os.path.isfile(file_path):
                     file_tasks.append((file_path, current_remote_dir))
 
-        print(f"Found {len(file_tasks)} files. Submitting to worker pool (Max Connections: {max_connections})...")
+        print(f"Found {len(file_tasks)} files. Submitting to worker pool (Max Connections: {max_connections})...\n")
 
         successful = 0
         failed = 0
@@ -397,10 +398,15 @@ def process_directory(directory_path, remote_directory, remote_host, username, m
                     else:
                         failed += 1
                 except Exception as e:
-                    print(f"Unhandled exception processing {path}: {e}")
+                    tqdm.write(f"Unhandled exception processing {path}: {e}")
                     failed += 1
 
-        print("\n================ Transfer Summary ================")
+        # Flush streams and advance past all progress bar positions cleanly
+        sys.stdout.flush()
+        sys.stderr.flush()
+        print("\n" * MAX_CONCURRENT_FILES)
+
+        print("================ Transfer Summary ================")
         print(f"Total Files Handled: {len(file_tasks)}")
         print(f"Successfully Processed/Verified: {successful}")
         print(f"Failed Transfers: {failed}")
