@@ -162,7 +162,21 @@ def upload_part(remote_host, username, remote_path, local_path, num, offset, par
     return False
 
 
+def determine_parts_per_file(file_size_bytes):
+    """Dynamically determines the number of parallel streams based on file size."""
+    MB = 1024 * 1024
+    GB = 1024 * MB
+
+    if file_size_bytes < 50 * MB:
+        return 1
+    elif file_size_bytes < 1 * GB:
+        return 4
+    else:
+        return 16
+
+
 def process_file(file_path, remote_directory, remote_host, username, progress_queue, position, connection_semaphore):
+    """Handles checking, staging, parallel chunk execution, and post-transfer verification for a single file."""
     file_name = os.path.basename(file_path)
     remote_file_path = os.path.join(remote_directory, file_name).replace("\\", "/")
     total_size = os.path.getsize(file_path)
@@ -178,20 +192,21 @@ def process_file(file_path, remote_directory, remote_host, username, progress_qu
         print(f"[Fail] Could not initialize remote file stub for {file_name}.")
         return False
 
-    # 3. Process chunk transfers using inner pool
-    parts = list(split_file_into_parts(file_path, PARTS_PER_FILE))
+    # 3. Determine dynamic stream count based on file size
+    parts_per_file = determine_parts_per_file(total_size)
+    parts = list(split_file_into_parts(file_path, parts_per_file))
     
     with tqdm(
         total=total_size,
-        desc=f"Pushing {file_name[:20]}",
+        desc=f"Pushing {file_name[:20]} ({parts_per_file} streams)",
         unit="B",
         unit_scale=True,
         position=position,
         leave=False,
     ) as progress_bar:
         
-        # Parallel execution of file chunks
-        with ProcessPoolExecutor(max_workers=PARTS_PER_FILE) as chunk_executor:
+        # Parallel execution scaled to dynamic stream count
+        with ProcessPoolExecutor(max_workers=parts_per_file) as chunk_executor:
             futures = [
                 chunk_executor.submit(
                     upload_part,
